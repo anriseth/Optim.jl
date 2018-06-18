@@ -49,6 +49,8 @@ multivariate_tests = [
     "solvers/constrained/ipnewton/counter",
     "solvers/constrained/ipnewton/ipnewton_unconstrained",
     "solvers/constrained/ipnewton/readme",
+    "solvers/constrained/ipnewton/ipbfgs",
+    "solvers/constrained/ipnewton/ipbfgs_unconstrained",
     "solvers/constrained/samin",
     ## first order
     "solvers/first_order/accelerated_gradient_descent",
@@ -145,6 +147,7 @@ function run_optim_tests(method; convergence_exceptions = (),
     end
 end
 
+# TODO: We should try to merge this function with run_optim_tests
 function run_optim_tests_constrained(method; convergence_exceptions = (),
                          minimizer_exceptions = (),
                          minimum_exceptions = (),
@@ -155,7 +158,7 @@ function run_optim_tests_constrained(method; convergence_exceptions = (),
                          show_trace = false,
                          show_res = false,
                          show_itcalls = false)
-    # TODO: Update with constraints?
+    # TODO: Update with constrained problems
     # Loop over unconstrained problems
     for (name, prob) in MVP.UnconstrainedProblems.examples
         if !isfinite(prob.minimum) || !any(isfinite, prob.solutions)

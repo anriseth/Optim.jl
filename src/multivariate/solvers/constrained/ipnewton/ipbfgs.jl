@@ -1,20 +1,22 @@
-struct IPNewton{F,Tμ<:Union{Symbol,Number}} <: IPOptimizer{F}
+struct IPBFGS{F,Tμ<:Union{Symbol,Number},H<:Function} <: IPOptimizer{F}
     linesearch!::F
     μ0::Tμ      # Initial value for the barrier penalty coefficient μ
     show_linesearch::Bool
+    initial_invH::H
     # TODO: μ0, and show_linesearch were originally in options
 end
 
-Base.summary(::IPNewton) = "Interior Point Newton"
+Base.summary(::IPBFGS) = "Interior Point quasi-Newton (BFGS)"
 
 # TODO: Add support for InitialGuess from LineSearches
 """
-# Interior-point Newton
+# Interior point quasi-Newton (BFGS)
 ## Constructor
 ```jl
-IPNewton(; linesearch::Function = Optim.backtrack_constrained_grad,
+IPBFGS(; linesearch::Function = Optim.backtrack_constrained_grad,
          μ0::Union{Symbol,Number} = :auto,
-         show_linesearch::Bool = false)
+         show_linesearch::Bool = false,
+         initial_invH = x-> eye(eltype(x), length(x)))
 ```
 
 The initial barrier penalty coefficient `μ0` can be chosen as a number, or set
@@ -29,7 +31,7 @@ interior-point methods. In future we hope to support more algorithms from
 `LineSearches.jl`.
 
 ## Description
-The `IPNewton` method implements an interior-point primal-dual Newton algorithm for solving
+The `IPBFGS` method implements an interior-point primal-dual BFGS algorithm for solving
 nonlinear, constrained optimization problems. See Nocedal and Wright (Ch. 19, 2006) for a discussion of
 interior-point methods for constrained optimization.
 
@@ -39,20 +41,19 @@ The algorithm was [originally written by Tim Holy](https://github.com/JuliaNLSol
  - J Nocedal, SJ Wright (2006), Numerical optimization, second edition. Springer.
  - A Wächter, LT Biegler (2006), On the implementation of an interior-point filter line-search algorithm for large-scale nonlinear programming. Mathematical Programming 106 (1), 25-57.
 """
-IPNewton(; linesearch::Function = backtrack_constrained_grad,
+IPBFGS(; linesearch::Function = backtrack_constrained_grad,
          μ0::Union{Symbol,Number} = :auto,
-         show_linesearch::Bool = false) =
-  IPNewton(linesearch, μ0, show_linesearch)
+         show_linesearch::Bool = false,
+         initial_invH = x-> eye(eltype(x), length(x))) =
+  IPBFGS(linesearch, μ0, show_linesearch, initial_invH)
 
-type IPNewtonState{T,Tx} <: AbstractBarrierState
+type IPBFGSState{T,Tx} <: AbstractBarrierState
     x::Tx
     f_x::T
     x_previous::Tx
     g::Tx
     f_x_previous::T
     H::Matrix{T}
-    HP # TODO: remove HP? It's not used
-    Hd::Vector{Int8}  # TODO: remove Hd? It's not used
     s::Tx  # step for x
     # Barrier penalty fields
     μ::T                  # coefficient of the barrier penalty
@@ -72,15 +73,14 @@ type IPNewtonState{T,Tx} <: AbstractBarrierState
 end
 
 # TODO: Do we need this convert thing? I don't have any tests to check that it works
-function Base.convert{T,Tx,S,Sx}(::Type{IPNewtonState{T,Tx}}, state::IPNewtonState{S, Sx})
-    IPNewtonState(convert(Tx, state.x),
+function Base.convert{T,Tx,S,Sx}(::Type{IPBFGSState{T,Tx}}, state::IPBFGSState{S, Sx})
+    IPBFGSState(convert(Tx, state.x),
                   T(state.f_x),
                   convert(Tx, state.x_previous),
                   convert(Tx, state.g),
                   T(state.f_x_previous),
                   convert(Matrix{T}, state.H),
                   state.HP,
-                  state.Hd,
                   convert(Tx, state.s),
                   T(state.μ),
                   T(state.μnext),
@@ -103,7 +103,7 @@ function Base.convert{T,Tx,S,Sx}(::Type{IPNewtonState{T,Tx}}, state::IPNewtonSta
                   )
 end
 
-function initial_state(method::IPNewton, options, d::TwiceDifferentiable, constraints::TwiceDifferentiableConstraints, initial_x::Array{T}) where T
+function initial_state(method::IPBFGS, options, d::TwiceDifferentiable, constraints::TwiceDifferentiableConstraints, initial_x::Array{T}) where T
     # Check feasibility of the initial state
     mc = nconstraints(constraints)
     constr_c = Array{T}(mc)
@@ -123,7 +123,6 @@ function initial_state(method::IPNewton, options, d::TwiceDifferentiable, constr
     f_x, g_x = value_gradient!(d, initial_x)
     g .= g_x # needs to be a separate copy of g_x
     H = Matrix{T}(n, n)
-    Hd = Vector{Int8}(n)
     hessian!(d, initial_x)
     copy!(H, hessian(d))
 
@@ -138,15 +137,13 @@ function initial_state(method::IPNewton, options, d::TwiceDifferentiable, constr
     # b_ls = BarrierLineSearch(similar(constr_c), similar(bstate))
     b_ls = BarrierLineSearchGrad(similar(constr_c), similar(constr_J), similar(bstate), similar(bstate))
 
-    state = IPNewtonState(
+    state = IPBFGSState(
         copy(initial_x), # Maintain current state in state.x
         f_x, # Store current f in state.f_x
         copy(initial_x), # Maintain current state in state.x_previous
         g, # Store current gradient in state.g (TODO: includes Lagrangian calculation?)
         T(NaN), # Store previous f in state.f_x_previous
         H,
-        0,    # will be replaced
-        Hd,
         similar(initial_x), # Maintain current x-search direction in state.s
         μ,
         μ,
@@ -171,12 +168,12 @@ function initial_state(method::IPNewton, options, d::TwiceDifferentiable, constr
     state
 end
 
-function update_fg!(d, constraints::TwiceDifferentiableConstraints, state, method::IPNewton)
+function update_fg!(d, constraints::TwiceDifferentiableConstraints, state, method::IPBFGS)
     state.f_x, state.L, state.ev = lagrangian_fg!(state.g, state.bgrad, d, constraints.bounds, state.x, state.constr_c, state.constr_J, state.bstate, state.μ)
     update_gtilde!(d, constraints, state, method)
 end
 
-function update_gtilde!(d, constraints::TwiceDifferentiableConstraints, state, method::IPNewton)
+function update_gtilde!(d, constraints::TwiceDifferentiableConstraints, state, method::IPBFGS)
     # Calculate the modified x-gradient for the block-eliminated problem
     # gtilde is the gradient for the affine-scaling problem, i.e.,
     # with μ=0, used in the adaptive setting of μ. Once we calculate μ we'll correct it
@@ -197,7 +194,7 @@ function update_gtilde!(d, constraints::TwiceDifferentiableConstraints, state, m
     state
 end
 
-function update_h!(d, constraints::TwiceDifferentiableConstraints, state, method::IPNewton)
+function update_h!(d, constraints::TwiceDifferentiableConstraints, state, method::IPBFGS)
     x, μ, Hxx, J = state.x, state.μ, state.H, state.constr_J
     bstate, bgrad, bounds = state.bstate, state.bgrad, constraints.bounds
     m, n = size(J, 1), size(J, 2)
@@ -227,7 +224,7 @@ function update_h!(d, constraints::TwiceDifferentiableConstraints, state, method
     state
 end
 
-function update_state!(d, constraints::TwiceDifferentiableConstraints, state::IPNewtonState{T}, method::IPNewton, options) where T
+function update_state!(d, constraints::TwiceDifferentiableConstraints, state::IPBFGSState{T}, method::IPBFGS, options) where T
     state.f_x_previous, state.L_previous = state.f_x, state.L
     bstate, bstep, bounds = state.bstate, state.bstep, constraints.bounds
     qp = solve_step!(state, constraints, options, method.show_linesearch)
@@ -284,7 +281,7 @@ function update_state!(d, constraints::TwiceDifferentiableConstraints, state::IP
     false
 end
 
-function solve_step!(state::IPNewtonState, constraints, options, show_linesearch::Bool = false)
+function solve_step!(state::IPBFGSState, constraints, options, show_linesearch::Bool = false)
     x, s, μ, bounds = state.x, state.s, state.μ, constraints.bounds
     bstate, bstep, bgrad = state.bstate, state.bstep, state.bgrad
     J, Htilde = state.constr_J, state.Htilde

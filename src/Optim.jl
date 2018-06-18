@@ -61,7 +61,8 @@ module Optim
            Sphere,
            Stiefel,
 
-           IPNewton
+           IPNewton,
+           IPBFGS
 
     # Types
     include("types.jl")
@@ -152,6 +153,7 @@ module Optim
     include("multivariate/solvers/constrained/ipnewton/iplinesearch.jl")
     include("multivariate/solvers/constrained/ipnewton/interior.jl")
     include("multivariate/solvers/constrained/ipnewton/ipnewton.jl")
+    include("multivariate/solvers/constrained/ipnewton/ipbfgs.jl")
     # Convergence
     include("multivariate/solvers/constrained/ipnewton/utilities/assess_convergence.jl")
     # Traces
