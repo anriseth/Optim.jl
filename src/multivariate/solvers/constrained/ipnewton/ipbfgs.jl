@@ -53,7 +53,7 @@ type IPBFGSState{T,Tx} <: AbstractBarrierState
     x_previous::Tx
     g::Tx
     f_x_previous::T
-    H::Matrix{T}
+    invH::Matrix{T} # TODO: This doesn't have to be a matrix?
     s::Tx  # step for x
     # Barrier penalty fields
     μ::T                  # coefficient of the barrier penalty
@@ -69,7 +69,6 @@ type IPBFGSState{T,Tx} <: AbstractBarrierState
     Optim.@add_linesearch_fields()
     b_ls::BarrierLineSearchGrad{T}
     gtilde::Tx
-    Htilde
 end
 
 # TODO: Do we need this convert thing? I don't have any tests to check that it works
@@ -79,8 +78,7 @@ function Base.convert{T,Tx,S,Sx}(::Type{IPBFGSState{T,Tx}}, state::IPBFGSState{S
                   convert(Tx, state.x_previous),
                   convert(Tx, state.g),
                   T(state.f_x_previous),
-                  convert(Matrix{T}, state.H),
-                  state.HP,
+                  convert(Matrix{T}, state.invH),
                   convert(Tx, state.s),
                   T(state.μ),
                   T(state.μnext),
@@ -99,11 +97,10 @@ function Base.convert{T,Tx,S,Sx}(::Type{IPBFGSState{T,Tx}}, state::IPBFGSState{S
                   state.lsr,
                   convert(BarrierLineSearchGrad{T}, state.b_ls),
                   convert(Tx, state.gtilde),
-                  state.Htilde,
                   )
 end
 
-function initial_state(method::IPBFGS, options, d::TwiceDifferentiable, constraints::TwiceDifferentiableConstraints, initial_x::Array{T}) where T
+function initial_state(method::IPBFGS, options, d::OnceDifferentiable, constraints::OnceDifferentiableConstraints, initial_x::Array{T}) where T
     # Check feasibility of the initial state
     mc = nconstraints(constraints)
     constr_c = Array{T}(mc)
@@ -122,9 +119,10 @@ function initial_state(method::IPBFGS, options, d::TwiceDifferentiable, constrai
     f_x_previous = NaN
     f_x, g_x = value_gradient!(d, initial_x)
     g .= g_x # needs to be a separate copy of g_x
-    H = Matrix{T}(n, n)
-    hessian!(d, initial_x)
-    copy!(H, hessian(d))
+    #H = Matrix{T}(n, n)
+    #hessian!(d, initial_x)
+    #copy!(H, hessian(d))
+    invH = method.initial_invH(initial_x)
 
     # More constraints
     constr_J = Array{T}(mc, n)
@@ -143,7 +141,7 @@ function initial_state(method::IPBFGS, options, d::TwiceDifferentiable, constrai
         copy(initial_x), # Maintain current state in state.x_previous
         g, # Store current gradient in state.g (TODO: includes Lagrangian calculation?)
         T(NaN), # Store previous f in state.f_x_previous
-        H,
+        invH,
         similar(initial_x), # Maintain current x-search direction in state.s
         μ,
         μ,
@@ -160,20 +158,21 @@ function initial_state(method::IPBFGS, options, d::TwiceDifferentiable, constrai
         gtilde,
         0)
 
-    Hinfo = (state.H, hessianI(initial_x, constraints, 1./bstate.slack_c, 1))
-    initialize_μ_λ!(state, constraints.bounds, Hinfo, method.μ0)
+    #Hinfo = (state.H, hessianI(initial_x, constraints, 1./bstate.slack_c, 1))
+    #initialize_μ_λ!(state, constraints.bounds, Hinfo, method.μ0)
+    initialize_μ_λ!(state, constraints.bounds, H, method.μ0)
     update_fg!(d, constraints, state, method)
     update_h!(d, constraints, state, method)
 
     state
 end
 
-function update_fg!(d, constraints::TwiceDifferentiableConstraints, state, method::IPBFGS)
+function update_fg!(d, constraints::OnceDifferentiableConstraints, state, method::IPBFGS)
     state.f_x, state.L, state.ev = lagrangian_fg!(state.g, state.bgrad, d, constraints.bounds, state.x, state.constr_c, state.constr_J, state.bstate, state.μ)
     update_gtilde!(d, constraints, state, method)
 end
 
-function update_gtilde!(d, constraints::TwiceDifferentiableConstraints, state, method::IPBFGS)
+function update_gtilde!(d, constraints::OnceDifferentiableConstraints, state, method::IPBFGS)
     # Calculate the modified x-gradient for the block-eliminated problem
     # gtilde is the gradient for the affine-scaling problem, i.e.,
     # with μ=0, used in the adaptive setting of μ. Once we calculate μ we'll correct it
@@ -194,8 +193,8 @@ function update_gtilde!(d, constraints::TwiceDifferentiableConstraints, state, m
     state
 end
 
-function update_h!(d, constraints::TwiceDifferentiableConstraints, state, method::IPBFGS)
-    x, μ, Hxx, J = state.x, state.μ, state.H, state.constr_J
+function update_h!(d, constraints::OnceDifferentiableConstraints, state, method::IPBFGS)
+    x, μ, invH, J = state.x, state.μ, state.invH, state.constr_J
     bstate, bgrad, bounds = state.bstate, state.bgrad, constraints.bounds
     m, n = size(J, 1), size(J, 2)
 
@@ -219,17 +218,16 @@ function update_h!(d, constraints::TwiceDifferentiableConstraints, state, method
     for (i,j) in enumerate(bounds.ineqx)
         Hxx[j,j] += bstate.λx[i]/bstate.slack_x[i]
     end
-    state.Htilde = cholfact(Positive, state.H, Val{true})
 
     state
 end
 
-function update_state!(d, constraints::TwiceDifferentiableConstraints, state::IPBFGSState{T}, method::IPBFGS, options) where T
+function update_state!(d, constraints::OnceDifferentiableConstraints, state::IPBFGSState{T}, method::IPBFGS, options) where T
     state.f_x_previous, state.L_previous = state.f_x, state.L
-    bstate, bstep, bounds = state.bstate, state.bstep, constraints.bounds
     qp = solve_step!(state, constraints, options, method.show_linesearch)
     # If a step α=1 will not change any of the parameters, we can quit now.
     # This prevents a futile linesearch.
+    bstate, bstep, bounds = state.bstate, state.bstep, constraints.bounds
     if is_smaller_eps(state.x, state.s) &&
         is_smaller_eps(bstate.slack_x, bstep.slack_x) &&
         is_smaller_eps(bstate.slack_c, bstep.slack_c) &&
@@ -284,28 +282,27 @@ end
 function solve_step!(state::IPBFGSState, constraints, options, show_linesearch::Bool = false)
     x, s, μ, bounds = state.x, state.s, state.μ, constraints.bounds
     bstate, bstep, bgrad = state.bstate, state.bstep, state.bgrad
-    J, Htilde = state.constr_J, state.Htilde
+    J, invH = state.constr_J, state.invH
     # Solve the Newton step
     JE = jacobianE(state, bounds)
     gE = [bgrad.λxE;
           bgrad.λcE]
-    M = JE*(Htilde \ JE')
+    #M = JE*(Htilde \ JE')
+    M = JE*(invH * JE')
     MF = cholfact(Positive, M, Val{true})
     # These are a solution to the affine-scaling problem (with μ=0)
-    ΔλE0 = MF \ (gE + JE * (Htilde \ state.gtilde))
-    Δx0 = Htilde \ (JE'*ΔλE0 - state.gtilde)
+    ΔλE0 = MF \ (gE + JE * (invH * state.gtilde))
+    Δx0 = invH * (JE'*ΔλE0 - state.gtilde)
     # Check that the solution to the linear equations represents an improvement
-    Hpstepx, HstepλE = full(Htilde)*Δx0 - JE'*ΔλE0, -JE*Δx0  # TODO: don't use full here
-    # TODO: How to handle show_linesearch?
-    # This was originally in options.show_linesearch, but I removed it as none of the other Optim algorithms have it there.
-    # We should move show_linesearch back to options when we refactor
-    # LineSearches to work on the function ϕ(α)
+    #Hpstepx, HstepλE = full(Htilde)*Δx0 - JE'*ΔλE0, -JE*Δx0  # TODO: don't use full here
+    HstepλE = -JE*Δx0
     if show_linesearch
-        println("|gx| = $(vecnorm(state.gtilde)), |Hstepx + gx| = $(vecnorm(Hpstepx+state.gtilde))")
+        #println("|gx| = $(vecnorm(state.gtilde)), |Hpstepx + gx| = $(vecnorm(Hpstepx+state.gtilde))")
+        println("|gx| = $(vecnorm(state.gtilde))")
         println("|gE| = $(vecnorm(gE)), |HstepλE + gE| = $(vecnorm(HstepλE+gE))")
     end
-    if vecnorm(gE) + vecnorm(state.gtilde) < max(vecnorm(HstepλE + gE),
-                                           vecnorm(Hpstepx  + state.gtilde))
+    if vecnorm(gE) + vecnorm(state.gtilde) < max(vecnorm(HstepλE + gE),0)
+                                                 #vecnorm(Hpstepx  + state.gtilde))
         # Precision problems gave us a worse solution than the one we started with, abort
         fill!(s, 0)
         fill!(bstep, 0)
@@ -329,15 +326,16 @@ function solve_step!(state::IPBFGSState, constraints, options, show_linesearch::
     # Solve for the *real* step (including μ)
     μsinv = μ * [bounds.σx./bstate.slack_x; bounds.σc./bstate.slack_c]
     gtildeμ = state.gtilde  - jacobianI(state, bounds)' * μsinv
-    ΔλE = MF \ (gE + JE * (Htilde \ gtildeμ))
-    Δx = Htilde \ (JE'*ΔλE - gtildeμ)
+    ΔλE = MF \ (gE + JE * (invH * gtildeμ))
+    Δx = invH * (JE'*ΔλE - gtildeμ)
     copy!(s, Δx)
     k = unpack_vec!(bstep.λxE, ΔλE, 0)
     k = unpack_vec!(bstep.λcE, ΔλE, k)
     k == length(ΔλE) || error("exhausted targets before ΔλE")
     solve_slack!(bstep, Δx, bounds, bstate, bgrad, J, μ)
     # Solve for the quadratic parameters (use the real H, not the posdef H)
-    Hstepx, HstepλE  = state.H*Δx - JE'*ΔλE, -JE*Δx
+    #Hstepx, HstepλE  = state.H*Δx - JE'*ΔλE, -JE*Δx
+    Hstepx, HstepλE  = -gtildeμ, -JE*Δx
     qp = state.L, slopealpha(state.s, state.g, bstep, bgrad), dot(Δx, Hstepx) + dot(ΔλE, HstepλE)
     qp
 end
@@ -372,22 +370,3 @@ end
 function default_options(method::ConstrainedOptimizer)
     Dict(:allow_f_increases => true, :successive_f_tol => 2)
 end
-
-
-# Utility functions that assist in testing: they return the "full
-# Hessian" and "full gradient" for the equation with the slack and λI
-# eliminated.
-# TODO: should we put these elsewhere?
-function Hf(bounds::ConstraintBounds, state)
-    JE = jacobianE(state, bounds)
-    Hf = [full(state.Htilde) -JE';
-          -JE zeros(eltype(JE), size(JE, 1), size(JE, 1))]
-end
-Hf(constraints, state) = Hf(constraints.bounds, state)
-function gf(bounds::ConstraintBounds, state)
-    bstate, μ = state.bstate, state.μ
-    μsinv = μ * [bounds.σx./bstate.slack_x; bounds.σc./bstate.slack_c]
-    gtildeμ = state.gtilde  - jacobianI(state, bounds)' * μsinv
-    [gtildeμ; state.bgrad.λxE; state.bgrad.λcE]
-end
-gf(constraints, state) = gf(constraints.bounds, state)
