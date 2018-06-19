@@ -50,7 +50,7 @@ type IPNewtonState{T,Tx} <: AbstractBarrierState
     x_previous::Tx
     g::Tx
     f_x_previous::T
-    H::Matrix{T}
+    H::Matrix{T}          # Hessian of the Lagrangian?
     HP # TODO: remove HP? It's not used
     Hd::Vector{Int8}  # TODO: remove Hd? It's not used
     s::Tx  # step for x
@@ -68,7 +68,7 @@ type IPNewtonState{T,Tx} <: AbstractBarrierState
     Optim.@add_linesearch_fields()
     b_ls::BarrierLineSearchGrad{T}
     gtilde::Tx
-    Htilde
+    Htilde               # Positive Cholesky factorization of H from PositiveFactorizations.jl
 end
 
 # TODO: Do we need this convert thing? I don't have any tests to check that it works
@@ -222,7 +222,7 @@ function update_h!(d, constraints::TwiceDifferentiableConstraints, state, method
     for (i,j) in enumerate(bounds.ineqx)
         Hxx[j,j] += bstate.λx[i]/bstate.slack_x[i]
     end
-    state.Htilde = cholfact(Positive, state.H, Val{true})
+    state.Htilde = cholfact(Positive, Hxx, Val{true})
 
     state
 end
